@@ -1,0 +1,21 @@
+[package]
+name = "sds-scanner"
+version = "0.1.0"
+edition = "2021"
+description = "Locate passkey security-domain secrets (SDS) in Chrome process memory dumps"
+
+[dependencies]
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+memmap2 = "0.9"
+memchr = "2"
+rayon = "1"
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
