@@ -396,12 +396,14 @@ mod live {
 
     /// 枚举 chrome.exe 并尝试打开。沙箱化的渲染进程为低完整性级别，
     /// 同用户进程 OpenProcess 会失败，因此天然被过滤掉；主进程可打开。
-    pub fn open_chrome_processes() -> Vec<ChromeProcess> {
+    /// 返回 (可打开进程列表, 打开失败数量)。
+    pub fn open_chrome_processes() -> (Vec<ChromeProcess>, u32) {
         let mut out = Vec::new();
+        let mut failed = 0u32;
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if snap == INVALID_HANDLE_VALUE {
-                return out;
+                return (out, failed);
             }
             let mut entry: PROCESSENTRY32W = std::mem::zeroed();
             entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
@@ -424,16 +426,20 @@ mod live {
                             pid: entry.th32ProcessID,
                             handle,
                         });
+                    } else {
+                        failed += 1;
                     }
                 }
                 ok = Process32NextW(snap, &mut entry);
             }
             CloseHandle(snap);
         }
-        out
+        (out, failed)
     }
 
-    /// 枚举进程的可读私有内存区域，分块（带重叠）读出并交给回调。
+    /// 枚举进程的可读内存区域，分块（带重叠）读出并交给回调。
+    /// 覆盖 PRIVATE（堆，SDS 所在）、IMAGE（chrome.dll，常量字符串锚点所在）
+    /// 和 MAPPED（LevelDB 等映射文件，密文锚点所在）。
     /// 返回 (区域数, 读取字节数)。
     pub fn for_each_chunk<F: FnMut(&[u8], u64)>(
         handle: HANDLE,
@@ -459,10 +465,7 @@ mod live {
                 }
                 let base = mbi.BaseAddress as usize;
                 let next = base.saturating_add(mbi.RegionSize);
-                if mbi.State == MEM_COMMIT
-                    && mbi.Type == MEM_PRIVATE
-                    && READABLE.contains(&mbi.Protect)
-                {
+                if mbi.State == MEM_COMMIT && READABLE.contains(&mbi.Protect) {
                     regions += 1;
                     let mut offset = 0usize;
                     while offset < mbi.RegionSize {
@@ -557,7 +560,7 @@ fn main() {
 
     #[cfg(windows)]
     if args.live {
-        let procs = live::open_chrome_processes();
+        let (procs, failed) = live::open_chrome_processes();
         if procs.is_empty() {
             eprintln!(
                 "错误: 未找到可访问的 chrome.exe 进程（需要 Chrome 正在运行，\
@@ -565,7 +568,11 @@ fn main() {
             );
             std::process::exit(2);
         }
-        eprintln!("找到 {} 个可访问的 chrome.exe 进程", procs.len());
+        eprintln!(
+            "找到 {} 个可访问的 chrome.exe 进程（{} 个因权限/沙箱被跳过）",
+            procs.len(),
+            failed
+        );
         for proc in &procs {
             eprintln!("扫描 PID {} ...", proc.pid);
             let (regions, bytes) =
@@ -578,6 +585,11 @@ fn main() {
                 regions,
                 bytes as f64 / 1e6
             );
+            if bytes < 100_000_000 {
+                eprintln!(
+                    "  警告: 该进程内存量偏小，可能不是 Chrome 主进程（浏览器进程）"
+                );
+            }
         }
         let mut hits = ctx.hits.into_inner().unwrap();
         print_hits(&mut hits, reference.credential_id.as_deref());
