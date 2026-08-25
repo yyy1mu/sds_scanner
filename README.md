@@ -58,4 +58,5 @@ sds-scanner.exe --live --jsonl passkeys.jsonl [--window 65536] [--anchor-hex <he
 - 实现：`Toolhelp32` 枚举 chrome.exe → `OpenProcess(PROCESS_VM_READ)` → `VirtualQueryEx` 枚举 `MEM_COMMIT + MEM_PRIVATE + 可读` 区域 → `ReadProcessMemory` 分块读取（16MB 块、64KB 重叠防锚点跨块）。
 - 沙箱化的渲染进程是低完整性级别，同用户也 `OpenProcess` 失败，会被自动跳过；主进程（EnclaveManager 所在）可以打开。
 - 权限要求与 procdump 相同：与 Chrome 同用户、同完整性级别即可，无需管理员。
-- 推荐时机：删掉 `passkey_enclave_state` 强制 re-enrollment，在用户输完 GPM PIN 后立即执行 `--live`（SDS 此刻进入主进程内存）。
+- `--pid <PID>` 只扫描指定进程（主进程 = 命令行不带 `--type=` 的那个）。
+- **`--watch` 持续监控模式**（解决时机问题，推荐）：先启动 `sds-scanner.exe --live --watch --jsonl passkeys.jsonl` 挂着，再去删 `passkey_enclave_state`、触发 passkey 登录、输 GPM PIN——SDS 一落进内存，下一轮扫描就能抓到，命中即自动退出。重扫间隔用 `--interval <秒>` 调整（默认 5）。

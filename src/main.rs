@@ -85,6 +85,16 @@ struct Args {
     /// 提供后额外把候选当 P-256 私钥做离线验签，可直接定位私钥本身
     #[arg(long)]
     oracle_json: Option<PathBuf>,
+    /// live 模式：持续监控，每隔 --interval 秒重扫一轮直到命中。
+    /// 先启动 watch，再去触发 passkey/PIN，SDS 一落进内存就会被抓到
+    #[arg(long)]
+    watch: bool,
+    /// watch 模式的重扫间隔（秒）
+    #[arg(long, default_value_t = 5)]
+    interval: u64,
+    /// live 模式：只扫描指定 PID（命令行不带 --type= 的主进程）
+    #[arg(long)]
+    pid: Option<u32>,
 }
 
 struct Reference {
@@ -112,6 +122,8 @@ struct ScanCtx<'a> {
     seen: Mutex<HashSet<u64>>,
     hits: Mutex<Vec<Hit>>,
     scanned: AtomicUsize,
+    /// watch 模式下避免每轮重复打印同一个 PKCS#8 命中
+    reported_pkcs8: Mutex<HashSet<u64>>,
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
@@ -363,7 +375,9 @@ fn scan_buffer(data: &[u8], base: u64, ctx: &ScanCtx) {
     // PKCS#8 前缀锚点：解出的明文私钥可能就在内存里，可直接拿到
     for hit in memmem::find_iter(data, &PKCS8_P256_PREFIX).take(20) {
         let start = hit + PKCS8_P256_PREFIX.len();
-        if start + 32 <= data.len() {
+        if start + 32 <= data.len()
+            && ctx.reported_pkcs8.lock().unwrap().insert(base + hit as u64)
+        {
             eprintln!(
                 "[!] PKCS#8 P-256 前缀 @ {:#x}，其后 32 字节疑似明文私钥: {}",
                 base + hit as u64,
@@ -542,8 +556,8 @@ mod live {
 
     /// 枚举 chrome.exe 并尝试打开。沙箱化的渲染进程为低完整性级别，
     /// 同用户进程 OpenProcess 会失败，因此天然被过滤掉；主进程可打开。
-    /// 返回 (可打开进程列表, 打开失败数量)。
-    pub fn open_chrome_processes() -> (Vec<ChromeProcess>, u32) {
+    /// only_pid 提供时只匹配该 PID。返回 (可打开进程列表, 打开失败数量)。
+    pub fn open_chrome_processes(only_pid: Option<u32>) -> (Vec<ChromeProcess>, u32) {
         let mut out = Vec::new();
         let mut failed = 0u32;
         unsafe {
@@ -561,7 +575,9 @@ mod live {
                     .position(|&c| c == 0)
                     .unwrap_or(entry.szExeFile.len());
                 let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
-                if name.eq_ignore_ascii_case("chrome.exe") {
+                if name.eq_ignore_ascii_case("chrome.exe")
+                    && only_pid.is_none_or(|p| p == entry.th32ProcessID)
+                {
                     let handle = OpenProcess(
                         PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
                         0,
@@ -657,6 +673,10 @@ fn main() {
         eprintln!("错误: 请二选一——指定 dump 文件，或使用 --live 扫描运行中的 Chrome");
         std::process::exit(2);
     }
+    if !args.live && (args.watch || args.pid.is_some()) {
+        eprintln!("错误: --watch/--interval/--pid 仅与 --live 配合使用");
+        std::process::exit(2);
+    }
 
     let reference = if let Some(hex) = &args.ciphertext_hex {
         let ciphertext = hex_decode(hex).unwrap_or_else(|e| {
@@ -727,45 +747,72 @@ fn main() {
         seen: Mutex::new(HashSet::new()),
         hits: Mutex::new(Vec::new()),
         scanned: AtomicUsize::new(0),
+        reported_pkcs8: Mutex::new(HashSet::new()),
     };
 
     #[cfg(windows)]
     if args.live {
-        let (procs, failed) = live::open_chrome_processes();
-        if procs.is_empty() {
-            eprintln!(
-                "错误: 未找到可访问的 chrome.exe 进程（需要 Chrome 正在运行，\
-                 且 sds-scanner 与 Chrome 同用户、同完整性级别）"
-            );
-            std::process::exit(2);
+        if args.full_scan && args.watch {
+            eprintln!("警告: watch + full-scan 每轮都要全量重扫，可能非常慢");
         }
-        eprintln!(
-            "找到 {} 个可访问的 chrome.exe 进程（{} 个因权限/沙箱被跳过）",
-            procs.len(),
-            failed
-        );
-        for proc in &procs {
-            eprintln!("扫描 PID {} ...", proc.pid);
-            let (regions, bytes, read_failures) =
-                live::for_each_chunk(proc.handle, args.window, |chunk, base| {
-                    scan_buffer(chunk, base, &ctx)
-                });
-            eprintln!(
-                "  PID {}: {} 个内存区域, {:.1} MB, {} 块读取失败",
-                proc.pid,
-                regions,
-                bytes as f64 / 1e6,
-                read_failures
-            );
-            if bytes < 100_000_000 {
-                eprintln!(
-                    "  警告: 该进程内存量偏小，可能不是 Chrome 主进程（浏览器进程）"
-                );
+        let mut round = 0u64;
+        loop {
+            round += 1;
+            let (procs, failed) = live::open_chrome_processes(args.pid);
+            if procs.is_empty() {
+                if !args.watch {
+                    eprintln!(
+                        "错误: 未找到可访问的 chrome.exe 进程（需要 Chrome 正在运行，\
+                         且 sds-scanner 与 Chrome 同用户、同完整性级别）"
+                    );
+                    std::process::exit(2);
+                }
+                eprintln!("第 {round} 轮: 暂无可访问的 chrome.exe，{} 秒后重试...", args.interval);
+                std::thread::sleep(std::time::Duration::from_secs(args.interval));
+                continue;
             }
+            if round == 1 {
+                eprintln!(
+                    "找到 {} 个可访问的 chrome.exe 进程（{} 个因权限/沙箱被跳过）",
+                    procs.len(),
+                    failed
+                );
+                if args.watch {
+                    eprintln!("watch 模式：每 {} 秒重扫一轮，命中即退出。现在可以去触发 passkey/PIN。", args.interval);
+                }
+            } else {
+                eprintln!("--- 第 {round} 轮扫描 ---");
+            }
+            // 每轮清空去重集合：同一地址的内容在轮次之间可能已变化，
+            // 带着旧 seen 会漏掉"复用了已扫地址"的新 SDS。
+            ctx.seen.lock().unwrap().clear();
+            for proc in &procs {
+                eprintln!("扫描 PID {} ...", proc.pid);
+                let (regions, bytes, read_failures) =
+                    live::for_each_chunk(proc.handle, args.window, |chunk, base| {
+                        scan_buffer(chunk, base, &ctx)
+                    });
+                eprintln!(
+                    "  PID {}: {} 个内存区域, {:.1} MB, {} 块读取失败",
+                    proc.pid,
+                    regions,
+                    bytes as f64 / 1e6,
+                    read_failures
+                );
+                if bytes < 100_000_000 {
+                    eprintln!(
+                        "  警告: 该进程内存量偏小，可能不是 Chrome 主进程（浏览器进程）"
+                    );
+                }
+            }
+            if !ctx.hits.lock().unwrap().is_empty() || !args.watch {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(args.interval));
         }
         let mut hits = ctx.hits.into_inner().unwrap();
         print_hits(&mut hits, reference.credential_id.as_deref());
-        eprintln!("\n完成: 命中 {} 个", hits.len());
+        eprintln!("\n完成: 共 {} 轮, 命中 {} 个", round, hits.len());
         std::process::exit(if hits.is_empty() { 1 } else { 0 });
     }
 
