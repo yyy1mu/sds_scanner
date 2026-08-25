@@ -59,4 +59,9 @@ sds-scanner.exe --live --jsonl passkeys.jsonl [--window 65536] [--anchor-hex <he
 - 沙箱化的渲染进程是低完整性级别，同用户也 `OpenProcess` 失败，会被自动跳过；主进程（EnclaveManager 所在）可以打开。
 - 权限要求与 procdump 相同：与 Chrome 同用户、同完整性级别即可，无需管理员。
 - `--pid <PID>` 只扫描指定进程（主进程 = 命令行不带 `--type=` 的那个）。
-- **`--watch` 持续监控模式**（解决时机问题，推荐）：先启动 `sds-scanner.exe --live --watch --jsonl passkeys.jsonl` 挂着，再去删 `passkey_enclave_state`、触发 passkey 登录、输 GPM PIN——SDS 一落进内存，下一轮扫描就能抓到，命中即自动退出。重扫间隔用 `--interval <秒>` 调整（默认 5）。
+- **`--watch` 流水线持续监控模式**（推荐）：reader 线程持续轮扫内存不休息，候选推进有界队列，worker 线程池后台并行验证——读和验解耦，命中即自动退出。先启动 `sds-scanner.exe --live --watch --jsonl passkeys.jsonl` 挂着，再触发 passkey/PIN 即可，无需掐时机。
+- **`--delete-enclave-state`**：扫描前自动删除 `passkey_enclave_state`（默认 `%LocalAppData%\Google\Chrome\User Data\Default\` 下，`--enclave-state-path` 可覆盖），强制 Chrome re-enrollment，让 SDS 重新进入内存。配合 `--watch` 一条命令完成全部动作：
+
+```
+sds-scanner.exe --live --watch --delete-enclave-state --jsonl passkeys.jsonl --oracle-json real_oracle.json
+```
