@@ -25,3 +25,16 @@ sds-scanner <dump文件> [--jsonl passkeys.jsonl] [--ciphertext-hex <hex>]
 - 验证逻辑与 Python 版完全相同（HKDF-SHA256 + AES-256-GCM，AAD 为 `WebauthnCredentialSpecifics.Encrypted`），已用同一合成 dump 对拍，结果一致。
 - 得益于 rayon 多线程，`--full-scan` 在 Rust 版是实际可用的：8MB dump（52 万候选）约 0.5 秒，数 GB 的全量对齐扫描约几分钟。
 - 若目标机器的 dump 较大，先用默认锚点模式（秒级），不命中再放大 `--window` 或 `--full-scan`。
+
+## Live 模式（仅 Windows）：直接扫描运行中的 Chrome
+
+不生成 dump 文件，直接读取正在运行的 chrome.exe 进程内存：
+
+```
+sds-scanner.exe --live --jsonl passkeys.jsonl [--window 65536] [--anchor-hex <hex>]
+```
+
+- 实现：`Toolhelp32` 枚举 chrome.exe → `OpenProcess(PROCESS_VM_READ)` → `VirtualQueryEx` 枚举 `MEM_COMMIT + MEM_PRIVATE + 可读` 区域 → `ReadProcessMemory` 分块读取（16MB 块、64KB 重叠防锚点跨块）。
+- 沙箱化的渲染进程是低完整性级别，同用户也 `OpenProcess` 失败，会被自动跳过；主进程（EnclaveManager 所在）可以打开。
+- 权限要求与 procdump 相同：与 Chrome 同用户、同完整性级别即可，无需管理员。
+- 推荐时机：删掉 `passkey_enclave_state` 强制 re-enrollment，在用户输完 GPM PIN 后立即执行 `--live`（SDS 此刻进入主进程内存）。
