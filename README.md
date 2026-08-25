@@ -26,6 +26,27 @@ sds-scanner <dump文件> [--jsonl passkeys.jsonl] [--ciphertext-hex <hex>]
 - 得益于 rayon 多线程，`--full-scan` 在 Rust 版是实际可用的：8MB dump（52 万候选）约 0.5 秒，数 GB 的全量对齐扫描约几分钟。
 - 若目标机器的 dump 较大，先用默认锚点模式（秒级），不命中再放大 `--window` 或 `--full-scan`。
 
+## 验签预言机模式（--oracle-json）：直接找私钥本身
+
+提供一份**真实登录断言**（浏览器抓包 `login/finish` 里的 `authenticatorData` / `clientDataJSON` / `signature`，b64url），扫描器会把每个候选 32 字节当作 P-256 私钥做离线验签：
+
+```json
+{"authenticatorData": "...", "clientDataJSON": "...", "signature": "..."}
+```
+
+```
+sds-scanner <dump文件> --jsonl passkeys.jsonl --oracle-json real_oracle.json [--full-scan]
+```
+
+- 命中即输出私钥 scalar 和推导的公钥，模式为 `ecdsa-oracle`——**完全绕过 SDS**。
+- 实现：预计算 u1/u2 后每个候选只需一次定基点标量乘，命中后再做完整验签复核。
+- 性能：oracle 模式下全量扫描 415MB dump（2600 万候选）约 10 分钟。
+
+## 其他新增
+
+- 新增内置锚点：`KeychainApplicationKey`（短前缀）、`hw_protected`、key_version 的小端 u32（从 jsonl 自动提取）。
+- live 模式现在统计并打印读取失败的内存块数，便于诊断扫描覆盖是否完整。
+
 ## Live 模式（仅 Windows）：直接扫描运行中的 Chrome
 
 不生成 dump 文件，直接读取正在运行的 chrome.exe 进程内存：

